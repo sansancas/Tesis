@@ -16,7 +16,9 @@ import numpy as np
 import pandas as pd
 import mne
 from scipy.signal import resample
+import time
 import tensorflow as tf
+# from tensorflow.data import Options
 from tensorflow.keras import layers, models, optimizers
 from tensorflow.keras import mixed_precision
 from sklearn.utils import class_weight
@@ -24,6 +26,7 @@ from sklearn.metrics import classification_report, roc_auc_score, confusion_matr
 import matplotlib.pyplot as plt
 
 # --- Configuración GPU y Mixed Precision ---
+os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 os.environ['TF_XLA_FLAGS'] = '--tf_xla_cpu_global_jit'
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
@@ -38,7 +41,34 @@ tf.config.optimizer.set_jit(True)
 tf.config.threading.set_inter_op_parallelism_threads(os.cpu_count())
 tf.config.threading.set_intra_op_parallelism_threads(os.cpu_count())
 
+options = tf.data.Options()
+
 # --- Funciones para TFRecord offline ---
+# --- Parámetros generales ---
+SHARD_PATTERN = 'train_windows-*.tfrecord'  # Asume shards como train_windows-00001-of-00004.tfrecord
+VAL_SHARD_PATTERN = 'val_windows-*.tfrecord'
+TEST_SHARD_PATTERN = 'ev_windows-*.tfrecord'
+DESIRED_FS = 256
+WIN_SECS = 60
+WIN_SIZE = DESIRED_FS * WIN_SECS
+BATCH_SIZE = 32  # Ajustable según memoria GPU
+SHARD_COUNT = 4  # Para la etapa de escritura si decides shardear
+
+class TimeLimitCallback(tf.keras.callbacks.Callback):
+    def __init__(self, max_seconds):
+        super().__init__()
+        self.max_seconds = max_seconds
+
+    def on_train_begin(self, logs=None):
+        self.start_time = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        elapsed = time.time() - self.start_time
+        if elapsed > self.max_seconds:
+            print(f"\n⏱ Tiempo límite alcanzado ({elapsed:.0f}s > {self.max_seconds}s), deteniendo entrenamiento.")
+            self.model.stop_training = True
+
+# --- Funciones TFRecord offline ---
 def _float_feature(values):
     return tf.train.Feature(float_list=tf.train.FloatList(value=values.flatten()))
 
@@ -46,39 +76,26 @@ def _int64_feature(value):
     return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
 
 def serialize_window(window: np.ndarray, label: int) -> bytes:
-    feature = {
-        'signal': _float_feature(window),
-        'label':  _int64_feature(label),
-    }
-    example = tf.train.Example(features=tf.train.Features(feature=feature))
-    return example.SerializeToString()
-
+    feat = {'signal': _float_feature(window), 'label': _int64_feature(label)}
+    return tf.train.Example(features=tf.train.Features(feature=feat)).SerializeToString()
 
 def write_tfrecord(output_path, edf_paths, lbl_paths, montage, fs_desired, win_size):
-    """
-    Recorre todos los archivos, genera ventanas y escribe en TFRecord.
-    """
     with tf.io.TFRecordWriter(output_path) as writer:
         for edf, lbl in zip(edf_paths, lbl_paths):
             sig, _, n = extract_montage_signals(edf, montage, fs_desired)
             df_lbl = load_label_csv(lbl)
-            # Etiquetas por muestra
             labels = np.zeros(n, dtype=np.int32)
             for _, r in df_lbl.iterrows():
                 if r['label'].strip().lower() == 'seiz':
                     s = int(np.floor(r['start_time'] * fs_desired))
                     e = min(n-1, int(np.ceil(r['stop_time'] * fs_desired)))
                     labels[s:e+1] = 1
-            # Extraer ventanas
-            stride = win_size
-            for start in range(0, n - win_size + 1, stride):
+            for start in range(0, n - win_size + 1, win_size):
                 window = sig[start:start + win_size]
                 lab = int(labels[start:start + win_size].any())
-                example = serialize_window(window, lab)
-                writer.write(example)
+                writer.write(serialize_window(window, lab))
 
-# --- Parsing y carga de TFRecord con tf.data ---
-
+# --- Parsing y carga de TFRecord con tf.data puro ---
 def parse_tfrecord(example_proto, win_size, n_channels=22):
     feature_desc = {
         'signal': tf.io.FixedLenFeature([win_size * n_channels], tf.float32),
@@ -89,15 +106,23 @@ def parse_tfrecord(example_proto, win_size, n_channels=22):
     label = tf.one_hot(parsed['label'], depth=2)
     return signal, label
 
-
-def load_dataset_from_tfrecord(filenames, win_size, batch_size, shuffle=True):
-    ds = tf.data.TFRecordDataset(filenames)
+def load_dataset_from_tfrecord(pattern, win_size, batch_size, shuffle=True):
+    files_ds = tf.data.Dataset.list_files(pattern)
+    ds = files_ds.interleave(
+        lambda f: tf.data.TFRecordDataset(f),
+        cycle_length=SHARD_COUNT,
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
     ds = ds.map(lambda x: parse_tfrecord(x, win_size), num_parallel_calls=tf.data.AUTOTUNE)
     if shuffle:
         ds = ds.shuffle(2048)
     ds = ds.batch(batch_size)
     ds = ds.prefetch(tf.data.AUTOTUNE)
-    return ds
+    ds = ds.apply(tf.data.experimental.prefetch_to_device('/gpu:0'))
+    opts = tf.data.Options()
+    opts.experimental_optimization.apply_default_optimizations = True
+    opts.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+    return ds.with_options(opts)
 
 # --------------------------------------------------------------
 
@@ -234,99 +259,69 @@ def build_tcn_eegnet(input_shape, blocks=10, k=4, f=68, dr=0.25):
 
 def compile_and_train(model, train_ds, val_ds, class_weights, lr=1e-3, epochs=20):
     opt = optimizers.Adam(learning_rate=lr)
+    # 2) Callback para guardar al final de cada epoch
+    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+        'tcn_eegnet_epoch{epoch:02d}.h5',
+        save_weights_only=False,     # guarda modelo completo
+        save_freq='epoch'
+    )
+
+    # 3) Integración en tu fit()
+    time_limit_cb = TimeLimitCallback(max_seconds=28800) 
     model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
-    return model.fit(train_ds, validation_data=val_ds, epochs=epochs, class_weight=class_weights)
+    return model.fit(train_ds, validation_data=val_ds, epochs=epochs, class_weight=class_weights, callbacks=[time_limit_cb, checkpoint_cb])
 
 # --- III. Ejecución principal ---
 if __name__=="__main__":
-    ROOT = "DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3/edf/"
+    # ROOT = "DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3/edf/"
+    # # 1) Preprocesamiento offline
     # change_label_extensions(ROOT)
     # train_l, dev_l, eval_l = list_label_paths(ROOT)
-    # tr_l = filter_by_montage(train_l, 'ar')
-    # dv_l = filter_by_montage(dev_l, 'ar')
-    # ev_l = filter_by_montage(eval_l, 'ar')
-    # get_edf = lambda p: p.replace('_bi.csv', '.edf')
-    # tr_e = [get_edf(p) for p in tr_l]
-    # dv_e = [get_edf(p) for p in dv_l]
-    # ev_e = [get_edf(p) for p in ev_l]
+    # tr_l = filter_by_montage(train_l, 'ar'); dv_l = filter_by_montage(dev_l, 'ar'); ev_l = filter_by_montage(eval_l, 'ar')
+    # tr_e = [p.replace('_bi.csv', '.edf') for p in tr_l]
+    # dv_e = [p.replace('_bi.csv', '.edf') for p in dv_l]
+    # ev_e = [p.replace('_bi.csv', '.edf') for p in ev_l]
 
-    desired_fs = 256
-    win_secs   = 60
-    win_size   = win_secs * desired_fs
-    batch_size = 32
+    # # write_tfrecord(f'train_windows-00000-of-{SHARD_COUNT:05d}.tfrecord', tr_e, tr_l, 'ar', DESIRED_FS, WIN_SIZE)
+    # # write_tfrecord(f'val_windows-00000-of-{SHARD_COUNT:05d}.tfrecord', dv_e, dv_l, 'ar', DESIRED_FS, WIN_SIZE)
+    # # write_tfrecord(f'ev_windows-00000-of-{SHARD_COUNT:05d}.tfrecord', ev_e, ev_l, 'ar', DESIRED_FS, WIN_SIZE)
+    # for i in range(SHARD_COUNT):
+    #     write_tfrecord(f'train_windows-{i:05d}-of-{SHARD_COUNT:05d}.tfrecord',
+    #                    tr_e, tr_l, 'ar', DESIRED_FS, WIN_SIZE)
+    #     write_tfrecord(f'val_windows-{i:05d}-of-{SHARD_COUNT:05d}.tfrecord',
+    #                    dv_e, dv_l, 'ar', DESIRED_FS, WIN_SIZE)
+    #     write_tfrecord(f'ev_windows-{i:05d}-of-{SHARD_COUNT:05d}.tfrecord',
+    #                    ev_e, ev_l, 'ar', DESIRED_FS, WIN_SIZE)
 
-    # Limitar a 20 archivos para pruebas rápidas
-    # tr_e = tr_e[:100]
-    # dv_e = dv_e[:100]
-    # ev_e = ev_e[:100]
+    # print('leyendo')
+    # 2) Lectura optimizada
+    train_ds = load_dataset_from_tfrecord(SHARD_PATTERN, WIN_SIZE, BATCH_SIZE, shuffle=True)
+    val_ds   = load_dataset_from_tfrecord(VAL_SHARD_PATTERN, WIN_SIZE, BATCH_SIZE, shuffle=False)
 
-    # count_bkg=count_seiz=0
-    # for _,y in windows_generator(tr_e,tr_l,'ar',desired_fs,win_size,mode=1):
-    #     if y[1]==1: count_seiz+=1
-    #     else:       count_bkg+=1
-    # print(f"Pre-entrenamiento: {count_bkg} ventanas de fondo, {count_seiz} ventanas con seiz")
-
-    # print(f"Train files: {len(tr_e)}, Dev files: {len(dv_e)}, Eval files: {len(ev_e)}")
-    
-    # cnt_b, cnt_s = 0,0
-    # for _,y in windows_generator(tr_e,tr_l,'ar',desired_fs,win_size,mode=1):
-    #     cnt_s += int(y[1]==1)
-    #     cnt_b += int(y[1]==0)
-    # print(f"Clases antes: fondo={cnt_b}, seiz={cnt_s}")
-    # # calcular pesos balanceados
-    # y_all = np.concatenate([np.zeros(cnt_b), np.ones(cnt_s)])
-    # cw = class_weight.compute_class_weight('balanced', classes=np.array([0.,1.]), y=y_all)
-    # class_weights={0: float(cw[0]), 1: float(cw[1])}
-    # print("class_weight:", class_weights)
-
-    # train_ds = create_tf_dataset(tr_e, tr_l, 'ar', desired_fs, win_size, 1, batch_size)#.repeat()
-    # val_ds   = create_tf_dataset(dv_e, dv_l, 'ar', desired_fs, win_size, 2, batch_size)
-
-    # write_tfrecord('train_windows.tfrecord', tr_e, tr_l, 'ar', desired_fs, win_size)
-    # write_tfrecord('val_windows.tfrecord', dv_e, dv_l, 'ar', desired_fs, win_size)
-    # write_tfrecord('ev_windows.tfrecord', ev_e, ev_l, 'ar', desired_fs, win_size)
-    # 2) Carga datasets desde TFRecord
-    train_ds = load_dataset_from_tfrecord(['train_windows.tfrecord'], win_size, batch_size, shuffle=True)
-    val_ds   = load_dataset_from_tfrecord(['val_windows.tfrecord'], win_size, batch_size, shuffle=False)
-
-    raw_count_ds = tf.data.TFRecordDataset(['train_windows.tfrecord'])
-    feature_desc_counts = {'label': tf.io.FixedLenFeature([], tf.int64)}
-    def _parse_label(x):
-        return tf.io.parse_single_example(x, feature_desc_counts)['label']
-    labels_ds = raw_count_ds.map(_parse_label, num_parallel_calls=tf.data.AUTOTUNE)
-    count_bkg = 0
-    count_seiz = 0
-    for lbl in labels_ds:
-        if lbl.numpy() == 1:
-            count_seiz += 1
-        else:
-            count_bkg += 1
-    print(f"Pre-entrenamiento: {count_bkg} ventanas de fondo, {count_seiz} ventanas con seiz")
-    # usar estos conteos para class_weight
-    # y_all = np.concatenate([np.zeros(count_bkg, dtype=int), np.ones(count_seiz, dtype=int)])
-    # cw = class_weight.compute_class_weight('balanced', classes=np.array([0, 1]), y=y_all)
+    # 3) Calcular class_weights rápidamente
+    print('calculando')
+    # raw_ds = tf.data.TFRecordDataset(tf.io.gfile.glob(SHARD_PATTERN))
+    # labels = [int(x['label'].numpy()) for x in raw_ds.map(lambda x: tf.io.parse_single_example(x, {'label': tf.io.FixedLenFeature([], tf.int64)}), num_parallel_calls=tf.data.AUTOTUNE)]
+    # cw = class_weight.compute_class_weight('balanced', classes=np.array([0,1]), y=np.array(labels))
     # class_weights = {0: float(cw[0]), 1: float(cw[1])}
-    # print("class_weight:", class_weights)
-    labels = [lbl for lbl in raw_count_ds.map(lambda x: tf.io.parse_single_example(x, feature_desc_counts)['label'])]
-    labels = [int(l.numpy()) for l in labels]
-    cw = class_weight.compute_class_weight('balanced', classes=np.array([0,1]), y=np.array(labels))
-    class_weights = {0: float(cw[0]), 1: float(cw[1])}
-    print("class_weight:", class_weights)
+    class_weights = {0: 0.5, 1: 8}
+    print('class_weight:', class_weights)
 
-    # model = build_tcn_eegnet((win_size, 22))
+    # 4) Entrenamiento distribuido
     strategy = tf.distribute.MirroredStrategy()
     with strategy.scope():
-        model = build_tcn_eegnet((win_size, 22))
-        opt = optimizers.Adam(learning_rate=1e-3)
-        model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
-    model.summary()
+        model = build_tcn_eegnet((WIN_SIZE, 22))
+        model.compile(optimizer=optimizers.Adam(1e-3), loss='categorical_crossentropy', metrics=['accuracy'])
 
-    history = compile_and_train(model, train_ds, val_ds, lr=1e-3, epochs=20, class_weights=class_weights)
-    model.save('tcn_eegnet_model')  # SavedModel format
+    history = model.fit(train_ds, validation_data=val_ds, epochs=20, class_weight=class_weights)
 
-    # --- IV. Evaluación en Test ---
-    #test_ds = create_tf_dataset(ev_e, ev_l, 'ar', desired_fs, win_size, 3, batch_size, shuffle=False)
-    test_ds = load_dataset_from_tfrecord(['ev_windows.tfrecord'], win_size, batch_size, shuffle=False)
+    # 5) Guardar modelo
+    model.save('tcn_eegnet_model')
+
+    # 6) Evaluación en Test
+    test_ds = load_dataset_from_tfrecord(TEST_SHARD_PATTERN, WIN_SIZE, BATCH_SIZE, shuffle=False)
+    results = model.evaluate(test_ds)
+    print('Resultados en Test:', dict(zip(model.metrics_names, results)))
 
     # Métricas globales
     eval_results = model.evaluate(test_ds)
